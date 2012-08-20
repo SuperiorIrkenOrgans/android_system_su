@@ -15,75 +15,44 @@
 */
 
 #include <stdlib.h>
-#include <sys/stat.h>
+#include <stdio.h>
 #include <limits.h>
 #include <cutils/log.h>
 
-#include <sqlite3.h>
-
 #include "su.h"
 
-// { int* pint; pint=(int*)data; ++(*pint); }
-
-sqlite3 *database_init()
+int database_check(const struct su_context *ctx)
 {
-    sqlite3 *db;
-    int version, rc, databaseStatus = 0;
-    char *zErrMsg = 0;
-
-    rc = sqlite3_open_v2(REQUESTOR_DATABASE_PATH, &db, SQLITE_OPEN_READONLY, NULL);
-    if ( rc ) {
-        LOGE("Couldn't open database: %s", sqlite3_errmsg(db));
-        return NULL;
-    }
-
-    // Create an automatic busy handler in case the db is locked
-    sqlite3_busy_timeout(db, 1000);
-    return db;
-}
-
-int database_check(sqlite3 *db, struct su_initiator *from, struct su_request *to)
-{
-    char sql[4096];
-    char *zErrmsg;
-    char **result;
-    int nrow,ncol;
-    int allow;
-    struct timeval tv;
-
-    sqlite3_snprintf(
-        sizeof(sql), sql,
-        "SELECT _id,name,allow FROM apps WHERE uid=%u AND exec_uid=%u AND exec_cmd='%q';",
-        (unsigned)from->uid, to->uid, to->command
-    );
-
-    if (strlen(sql) >= sizeof(sql)-1)
-        return DB_DENY;
-        
-    int error = sqlite3_get_table(db, sql, &result, &nrow, &ncol, &zErrmsg);
-    if (error != SQLITE_OK) {
-        LOGE("Database check failed with error message %s", zErrmsg);
-        if (error == SQLITE_BUSY) {
-            LOGE("Specifically, the database is busy");
+    FILE *fp;
+    char allow = '-';
+    char *filename = malloc(snprintf(NULL, 0, "%s/%u-%u", REQUESTOR_STORED_PATH, ctx->from.uid, ctx->to.uid) + 1);
+    sprintf(filename, "%s/%u-%u", REQUESTOR_STORED_PATH, ctx->from.uid, ctx->to.uid);
+    if ((fp = fopen(filename, "r"))) {
+    LOGD("Found file");
+        char cmd[PATH_MAX];
+        fgets(cmd, sizeof(cmd), fp);
+        int last = strlen(cmd) - 1;
+        LOGD("this is the last character %u of the string", cmd[5]);
+        if (cmd[last] == '\n') {
+            cmd[last] = '\0';
         }
-        return DB_DENY;
+        LOGD("Comparing %c %s, %u to %s", cmd[last - 2], cmd, last, get_command(&ctx->to));
+        if (strcmp(cmd, get_command(&ctx->to)) == 0) {
+            allow = fgetc(fp);
+        }
+        fclose(fp);
+    } else if ((fp = fopen(REQUESTOR_STORED_DEFAULT, "r"))) {
+    LOGD("Using default");
+        allow = fgetc(fp);
+        fclose(fp);
     }
-    
-    if (nrow == 0 || ncol != 3)
+    free(filename);
+
+    if (allow == '1') {
+        return DB_ALLOW;
+    } else if (allow == '0') {
+        return DB_DENY;
+    } else {
         return DB_INTERACTIVE;
-        
-    if (strcmp(result[0], "_id") == 0 && strcmp(result[2], "allow") == 0) {
-        if (strcmp(result[5], "1") == 0) {
-            allow = DB_ALLOW;
-        } else if (strcmp(result[5], "-1") == 0){
-            allow = DB_INTERACTIVE;
-        } else {
-            allow = DB_DENY;
-        }
-        return allow;
     }
-
-    sqlite3_free_table(result);
-    
-    return DB_INTERACTIVE;
 }

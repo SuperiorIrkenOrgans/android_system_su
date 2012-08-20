@@ -15,8 +15,6 @@
 ** limitations under the License.
 */
 
-#define LOG_TAG "su"
-
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -28,41 +26,22 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <endian.h>
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
+#include <getopt.h>
 #include <stdint.h>
 #include <pwd.h>
 
 #include <private/android_filesystem_config.h>
+#include <cutils/properties.h>
 #include <cutils/log.h>
 
-#include <sqlite3.h>
-
 #include "su.h"
-
-//extern char* _mktemp(char*); /* mktemp doesn't link right.  Don't ask me why. */
-
-extern sqlite3 *database_init();
-extern int database_check(sqlite3*, struct su_initiator*, struct su_request*);
+#include "utils.h"
 
 /* Still lazt, will fix this */
-static char *socket_path = NULL;
-static sqlite3 *db = NULL;
-
-static struct su_initiator su_from = {
-    .pid = -1,
-    .uid = 0,
-    .bin = "",
-    .args = "",
-};
-
-static struct su_request su_to = {
-    .uid = AID_ROOT,
-    .command = DEFAULT_COMMAND,
-};
+static char socket_path[PATH_MAX];
 
 static int from_init(struct su_initiator *from)
 {
@@ -71,6 +50,7 @@ static int from_init(struct su_initiator *from)
     int fd;
     ssize_t len;
     int i;
+    int err;
 
     from->uid = getuid();
     from->pid = getppid();
@@ -83,9 +63,10 @@ static int from_init(struct su_initiator *from)
         return -1;
     }
     len = read(fd, args, sizeof(args));
+    err = errno;
     close(fd);
     if (len < 0 || len == sizeof(args)) {
-        PLOGE("Reading command line");
+        PLOGEV("Reading command line", err);
         return -1;
     }
 
@@ -127,6 +108,24 @@ static int from_init(struct su_initiator *from)
     return 0;
 }
 
+static void populate_environment(const struct su_context *ctx)
+{
+    struct passwd *pw;
+
+    if (ctx->to.keepenv)
+        return;
+
+    pw = getpwuid(ctx->to.uid);
+    if (pw) {
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("SHELL", ctx->to.shell, 1);
+        if (ctx->to.login || ctx->to.uid) {
+            setenv("USER", pw->pw_name, 1);
+            setenv("LOGNAME", pw->pw_name, 1);
+        }
+    }
+}
+
 static void socket_cleanup(void)
 {
     unlink(socket_path);
@@ -135,20 +134,17 @@ static void socket_cleanup(void)
 static void cleanup(void)
 {
     socket_cleanup();
-    if (db) sqlite3_close(db);
 }
 
 static void cleanup_signal(int sig)
 {
     socket_cleanup();
-    exit(sig);
+    exit(128 + sig);
 }
 
-static int socket_create_temp(unsigned req_uid)
+static int socket_create_temp(char *path, size_t len)
 {
-    static char buf[PATH_MAX];
-    int fd, err;
-
+    int fd;
     struct sockaddr_un sun;
 
     fd = socket(AF_LOCAL, SOCK_STREAM, 0);
@@ -157,41 +153,32 @@ static int socket_create_temp(unsigned req_uid)
         return -1;
     }
 
-    for (;;) {
-        memset(&sun, 0, sizeof(sun));
-        sun.sun_family = AF_LOCAL;
-        strcpy(buf, SOCKET_PATH_TEMPLATE);
-        socket_path = mktemp(buf);
-        snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", socket_path);
+    memset(&sun, 0, sizeof(sun));
+    sun.sun_family = AF_LOCAL;
+    snprintf(path, len, "%s/.socket%d", REQUESTOR_CACHE_PATH, getpid());
+    snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", path);
 
-        if (bind(fd, (struct sockaddr*)&sun, sizeof(sun)) < 0) {
-            if (errno != EADDRINUSE) {
-                PLOGE("bind");
-                return -1;
-            }
-        } else {
-            break;
-        }
-    }
+    /*
+     * Delete the socket to protect from situations when
+     * something bad occured previously and the kernel reused pid from that process.
+     * Small probability, isn't it.
+     */
+    unlink(sun.sun_path);
 
-    if (chmod(sun.sun_path, 0600) < 0) {
-        PLOGE("chmod(socket)");
-        unlink(sun.sun_path);
-        return -1;
-    }
-
-    if (chown(sun.sun_path, req_uid, req_uid) < 0) {
-        PLOGE("chown(socket)");
-        unlink(sun.sun_path);
-        return -1;
+    if (bind(fd, (struct sockaddr*)&sun, sizeof(sun)) < 0) {
+        PLOGE("bind");
+        goto err;
     }
 
     if (listen(fd, 1) < 0) {
         PLOGE("listen");
-        return -1;
+        goto err;
     }
 
     return fd;
+err:
+    close(fd);
+    return -1;
 }
 
 static int socket_accept(int serv_fd)
@@ -219,219 +206,392 @@ static int socket_accept(int serv_fd)
     return fd;
 }
 
-static int socket_receive_result(int serv_fd, char *result, ssize_t result_len)
+static int socket_send_request(int fd, const struct su_context *ctx)
+{
+    size_t len;
+    size_t bin_size, cmd_size;
+    char *cmd;
+
+#define write_token(fd, data)				\
+do {							\
+	uint32_t __data = htonl(data);			\
+	size_t __count = sizeof(__data);		\
+	size_t __len = write((fd), &__data, __count);	\
+	if (__len != __count) {				\
+		PLOGE("write(" #data ")");		\
+		return -1;				\
+	}						\
+} while (0)
+
+    write_token(fd, PROTO_VERSION);
+    write_token(fd, PATH_MAX);
+    write_token(fd, ARG_MAX);
+    write_token(fd, ctx->from.uid);
+    write_token(fd, ctx->to.uid);
+    bin_size = strlen(ctx->from.bin) + 1;
+    write_token(fd, bin_size);
+    len = write(fd, ctx->from.bin, bin_size);
+    if (len != bin_size) {
+        PLOGE("write(bin)");
+        return -1;
+    }
+    cmd = get_command(&ctx->to);
+    cmd_size = strlen(cmd) + 1;
+    write_token(fd, cmd_size);
+    len = write(fd, cmd, cmd_size);
+    if (len != cmd_size) {
+        PLOGE("write(cmd)");
+        return -1;
+    }
+    return 0;
+}
+
+static int socket_receive_result(int fd, char *result, ssize_t result_len)
 {
     ssize_t len;
-    char buf[64];
     
-    for (;;) {
-        int fd = socket_accept(serv_fd);
-        if (fd < 0)
-            return -1;
-
-        len = read(fd, result, result_len-1);
-        if (len < 0) {
-            PLOGE("read(result)");
-            return -1;
-        }
-
-        if (len > 0) {
-            break;
-        }
+    len = read(fd, result, result_len-1);
+    if (len < 0) {
+        PLOGE("read(result)");
+        return -1;
     }
-
     result[len] = '\0';
 
     return 0;
 }
 
-static void usage(void)
+static void usage(int status)
 {
-    printf("Usage: su [options] [LOGIN]\n\n");
-    printf("Options:\n");
-    printf("  -c, --command COMMAND         pass COMMAND to the invoked shell\n");
-    printf("  -h, --help                    display this help message and exit\n");
-    printf("  -, -l, --login                make the shell a login shell\n");
-    // I'll look more into this to figure out what it's about,
-    // maybe implement it later
-//    printf("  -m, -p,\n");
-//    printf("  --preserve-environment        do not reset environment variables, and\n");
-//    printf("                                keep the same shell\n");
-    printf("  -s, --shell SHELL             use SHELL instead of the default in passwd\n");
-    printf("  -v, --version                 display version number and exit\n");
-    printf("  -V                            display version code and exit. this is\n");
-    printf("                                used almost exclusively by Superuser.apk\n");
-    exit(EXIT_SUCCESS);
+    FILE *stream = (status == EXIT_SUCCESS) ? stdout : stderr;
+
+    fprintf(stream,
+    "Usage: su [options] [--] [-] [LOGIN] [--] [args...]\n\n"
+    "Options:\n"
+    "  -c, --command COMMAND         pass COMMAND to the invoked shell\n"
+    "  -h, --help                    display this help message and exit\n"
+    "  -, -l, --login                pretend the shell to be a login shell\n"
+    "  -m, -p,\n"
+    "  --preserve-environment        do not change environment variables\n"
+    "  -s, --shell SHELL             use SHELL instead of the default " DEFAULT_SHELL "\n"
+    "  -v, --version                 display version number and exit\n"
+    "  -V                            display version code and exit,\n"
+    "                                this is used almost exclusively by Superuser.apk\n");
+    exit(status);
 }
 
-static void deny(void)
+static void deny(const struct su_context *ctx)
 {
-    struct su_initiator *from = &su_from;
-    struct su_request *to = &su_to;
+    char *cmd = get_command(&ctx->to);
 
-    send_intent(&su_from, &su_to, "", 0, 1);
-    LOGW("request rejected (%u->%u %s)", from->uid, to->uid, to->command);
+    send_intent(ctx, "", 0, ACTION_RESULT);
+    LOGW("request rejected (%u->%u %s)", ctx->from.uid, ctx->to.uid, cmd);
     fprintf(stderr, "%s\n", strerror(EACCES));
     exit(EXIT_FAILURE);
 }
 
-static void allow(char *shell)
+static void allow(const struct su_context *ctx)
 {
-    struct su_initiator *from = &su_from;
-    struct su_request *to = &su_to;
-    char *exe = NULL;
+    char *arg0;
+    int argc, err;
 
-    send_intent(&su_from, &su_to, "", 1, 1);
+    umask(ctx->umask);
+    send_intent(ctx, "", 1, ACTION_RESULT);
 
-    if (!strcmp(shell, "")) {
-        strcpy(shell , "/system/bin/sh");
+    arg0 = strrchr (ctx->to.shell, '/');
+    arg0 = (arg0) ? arg0 + 1 : ctx->to.shell;
+    if (ctx->to.login) {
+        int s = strlen(arg0) + 2;
+        char *p = malloc(s);
+
+        if (!p)
+            exit(EXIT_FAILURE);
+
+        *p = '-';
+        strcpy(p + 1, arg0);
+        arg0 = p;
     }
-    exe = strrchr (shell, '/') + 1;
-    setgroups(0, NULL);
-    setresgid(to->uid, to->uid, to->uid);
-    setresuid(to->uid, to->uid, to->uid);
-    LOGD("%u %s executing %u %s using shell %s : %s", from->uid, from->bin,
-            to->uid, to->command, shell, exe);
-    if (strcmp(to->command, DEFAULT_COMMAND)) {
-        execl(shell, exe, "-c", to->command, (char*)NULL);
-    } else {
-        execl(shell, exe, "-", (char*)NULL);
+
+    /*
+     * Set effective uid back to root, otherwise setres[ug]id will fail
+     * if ctx->to.uid isn't root.
+     */
+    if (seteuid(0)) {
+        PLOGE("seteuid (root)");
+        exit(EXIT_FAILURE);
     }
+
+    populate_environment(ctx);
+
+    if (setresgid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
+        PLOGE("setresgid (%u)", ctx->to.uid);
+        exit(EXIT_FAILURE);
+    }
+    if (setresuid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
+        PLOGE("setresuid (%u)", ctx->to.uid);
+        exit(EXIT_FAILURE);
+    }
+
+#define PARG(arg)									\
+    (ctx->to.optind + (arg) < ctx->to.argc) ? " " : "",					\
+    (ctx->to.optind + (arg) < ctx->to.argc) ? ctx->to.argv[ctx->to.optind + (arg)] : ""
+
+    LOGD("%u %s executing %u %s using shell %s : %s%s%s%s%s%s%s%s%s%s%s%s%s%s",
+            ctx->from.uid, ctx->from.bin,
+            ctx->to.uid, get_command(&ctx->to), ctx->to.shell,
+            arg0, PARG(0), PARG(1), PARG(2), PARG(3), PARG(4), PARG(5),
+            (ctx->to.optind + 6 < ctx->to.argc) ? " ..." : "");
+
+    argc = ctx->to.optind;
+    if (ctx->to.command) {
+        ctx->to.argv[--argc] = ctx->to.command;
+        ctx->to.argv[--argc] = "-c";
+    }
+    ctx->to.argv[--argc] = arg0;
+    execv(ctx->to.shell, ctx->to.argv + argc);
+    err = errno;
     PLOGE("exec");
-    exit(EXIT_SUCCESS);
+    fprintf(stderr, "Cannot execute %s: %s\n", ctx->to.shell, strerror(err));
+    exit(EXIT_FAILURE);
 }
 
 int main(int argc, char *argv[])
 {
+    struct su_context ctx = {
+        .from = {
+            .pid = -1,
+            .uid = 0,
+            .bin = "",
+            .args = "",
+        },
+        .to = {
+            .uid = AID_ROOT,
+            .login = 0,
+            .keepenv = 0,
+            .shell = DEFAULT_SHELL,
+            .command = NULL,
+            .argv = argv,
+            .argc = argc,
+            .optind = 0,
+        },
+    };
     struct stat st;
-    static int socket_serv_fd = -1;
-    char buf[64], shell[PATH_MAX], *result;
-    int i, dballow;
-    unsigned req_uid;
+    int socket_serv_fd, fd;
+    char buf[64], *result, debuggable[PROPERTY_VALUE_MAX];
+    char enabled[PROPERTY_VALUE_MAX], build_type[PROPERTY_VALUE_MAX];
+    char cm_version[PROPERTY_VALUE_MAX];;
+    int c, dballow, len;
+    struct option long_opts[] = {
+        { "command",			required_argument,	NULL, 'c' },
+        { "help",			no_argument,		NULL, 'h' },
+        { "login",			no_argument,		NULL, 'l' },
+        { "preserve-environment",	no_argument,		NULL, 'p' },
+        { "shell",			required_argument,	NULL, 's' },
+        { "version",			no_argument,		NULL, 'v' },
+        { NULL, 0, NULL, 0 },
+    };
+    char *data;
+    unsigned sz;
 
-    for (i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "-c") || !strcmp(argv[i], "--command")) {
-            if (++i < argc) {
-                su_to.command = argv[i];
-            } else {
-                usage();
-            }
-        } else if (!strcmp(argv[i], "-s") || !strcmp(argv[i], "--shell")) {
-            if (++i < argc) {
-                strcpy(shell, argv[i]);
-            } else {
-                usage();
-            }
-        } else if (!strcmp(argv[i], "-v") || !strcmp(argv[i], "--version")) {
-            printf("%s\n", VERSION);
-            exit(EXIT_SUCCESS);
-        } else if (!strcmp(argv[i], "-V")) {
+    while ((c = getopt_long(argc, argv, "+c:hlmps:Vv", long_opts, NULL)) != -1) {
+        switch(c) {
+        case 'c':
+            ctx.to.command = optarg;
+            break;
+        case 'h':
+            usage(EXIT_SUCCESS);
+            break;
+        case 'l':
+            ctx.to.login = 1;
+            break;
+        case 'm':
+        case 'p':
+            ctx.to.keepenv = 1;
+            break;
+        case 's':
+            ctx.to.shell = optarg;
+            break;
+        case 'V':
             printf("%d\n", VERSION_CODE);
             exit(EXIT_SUCCESS);
-        } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            usage();
-        } else if (!strcmp(argv[i], "-") || !strcmp(argv[i], "-l") ||
-                !strcmp(argv[i], "--login")) {
-            ++i;
-            break;
-        } else {
-            break;
+        case 'v':
+            printf("%s\n", VERSION);
+            exit(EXIT_SUCCESS);
+        default:
+            /* Bionic getopt_long doesn't terminate its error output by newline */
+            fprintf(stderr, "\n");
+            usage(2);
         }
     }
-    if (i < argc-1) {
-        usage();
+    if (optind < argc && !strcmp(argv[optind], "-")) {
+        ctx.to.login = 1;
+        optind++;
     }
-    if (i == argc-1) {
+    /* username or uid */
+    if (optind < argc && strcmp(argv[optind], "--")) {
         struct passwd *pw;
-        pw = getpwnam(argv[i]);
+        pw = getpwnam(argv[optind]);
         if (!pw) {
-            su_to.uid = atoi(argv[i]);
+            char *endptr;
+
+            /* It seems we shouldn't do this at all */
+            errno = 0;
+            ctx.to.uid = strtoul(argv[optind], &endptr, 10);
+            if (errno || *endptr) {
+                LOGE("Unknown id: %s\n", argv[optind]);
+                fprintf(stderr, "Unknown id: %s\n", argv[optind]);
+                exit(EXIT_FAILURE);
+            }
         } else {
-            su_to.uid = pw->pw_uid;
+            ctx.to.uid = pw->pw_uid;
+        }
+        optind++;
+    }
+    if (optind < argc && !strcmp(argv[optind], "--")) {
+        optind++;
+    }
+    ctx.to.optind = optind;
+
+    if (from_init(&ctx.from) < 0) {
+        deny(&ctx);
+    }
+
+    // we can't simply use the property service, since we aren't launched from init and
+    // can't trust the location of the property workspace. find the properties ourselves.
+    data = read_file("/default.prop", &sz);
+    get_property(data, debuggable, "ro.debuggable", "0");
+    free(data);
+
+    data = read_file("/system/build.prop", &sz);
+    get_property(data, cm_version, "ro.cm.version", "");
+    get_property(data, build_type, "ro.build.type", "");
+    free(data);
+
+    data = read_file("/data/property/persist.sys.root_access", &sz);
+    if (data != NULL) {
+        len = strlen(data);
+        if (len >= PROPERTY_VALUE_MAX)
+            memcpy(enabled, "1", 2);
+        else
+            memcpy(enabled, data, len + 1);
+        free(data);
+    } else
+        memcpy(enabled, "1", 2);
+
+    ctx.umask = umask(027);
+
+    // CyanogenMod-specific behavior
+    if (strlen(cm_version) > 0) {
+        // only allow su on debuggable builds
+        if (strcmp("1", debuggable) != 0) {
+            LOGE("Root access is disabled on non-debug builds");
+            deny(&ctx);
+        }
+
+        // enforce persist.sys.root_access on non-eng builds
+        if (strcmp("eng", build_type) != 0 &&
+               (atoi(enabled) & 1) != 1 ) {
+            LOGE("Root access is disabled by system setting - enable it under settings -> developer options");
+            deny(&ctx);
+        }
+
+        // disallow su in a shell if appropriate
+        if (ctx.from.uid == AID_SHELL && (atoi(enabled) == 1)) {
+            LOGE("Root access is disabled by a system setting - enable it under settings -> developer options");
+            deny(&ctx);
         }
     }
 
-    if (from_init(&su_from) < 0) {
-        deny();
-    }
-
-    if (su_from.uid == AID_ROOT || su_from.uid == AID_SHELL)
-        allow(shell);
+    if (ctx.from.uid == AID_ROOT || ctx.from.uid == AID_SHELL)
+        allow(&ctx);
 
     if (stat(REQUESTOR_DATA_PATH, &st) < 0) {
         PLOGE("stat");
-        deny();
+        deny(&ctx);
     }
 
     if (st.st_gid != st.st_uid)
     {
         LOGE("Bad uid/gid %d/%d for Superuser Requestor application",
                 (int)st.st_uid, (int)st.st_gid);
-        deny();
+        deny(&ctx);
     }
 
-    req_uid = st.st_uid;
-
-    if (mkdir(REQUESTOR_CACHE_PATH, 0771) >= 0) {
-        chown(REQUESTOR_CACHE_PATH, req_uid, req_uid);
+    mkdir(REQUESTOR_CACHE_PATH, 0770);
+    if (chown(REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid)) {
+        PLOGE("chown (%s, %ld, %ld)", REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid);
+        deny(&ctx);
     }
 
-    //LOGD("sudb - Opening database");
-    db = database_init();
-    if (!db) {
-        LOGE("sudb - Could not open database, prompt user");
-        // if the database could not be opened, we can assume we need to
-        // prompt the user
-        dballow = DB_INTERACTIVE;
-    } else {
-        //LOGD("sudb - Database opened");
-        dballow = database_check(db, &su_from, &su_to);
-        // Close the database, we're done with it. If it stays open,
-        // it will cause problems
-        sqlite3_close(db);
-        //LOGD("sudb - Database closed");
+    if (setgroups(0, NULL)) {
+        PLOGE("setgroups");
+        deny(&ctx);
+    }
+    if (setegid(st.st_gid)) {
+        PLOGE("setegid (%lu)", st.st_gid);
+        deny(&ctx);
+    }
+    if (seteuid(st.st_uid)) {
+        PLOGE("seteuid (%lu)", st.st_uid);
+        deny(&ctx);
     }
 
+    dballow = database_check(&ctx);
     switch (dballow) {
-        case DB_DENY: deny();
-        case DB_ALLOW: allow(shell);
+        case DB_DENY: deny(&ctx);
+        case DB_ALLOW: allow(&ctx);
         case DB_INTERACTIVE: break;
-        default: deny();
+        default: deny(&ctx);
     }
-
-    socket_serv_fd = socket_create_temp(req_uid);
+    
+    socket_serv_fd = socket_create_temp(socket_path, sizeof(socket_path));
     if (socket_serv_fd < 0) {
-        deny();
+        deny(&ctx);
     }
 
     signal(SIGHUP, cleanup_signal);
     signal(SIGPIPE, cleanup_signal);
     signal(SIGTERM, cleanup_signal);
+    signal(SIGQUIT, cleanup_signal);
+    signal(SIGINT, cleanup_signal);
     signal(SIGABRT, cleanup_signal);
     atexit(cleanup);
 
-    if (send_intent(&su_from, &su_to, socket_path, -1, 0) < 0) {
-        deny();
+    if (send_intent(&ctx, socket_path, -1, ACTION_REQUEST) < 0) {
+        deny(&ctx);
     }
 
-    if (socket_receive_result(socket_serv_fd, buf, sizeof(buf)) < 0) {
-        deny();
+    fd = socket_accept(socket_serv_fd);
+    if (fd < 0) {
+        deny(&ctx);
+    }
+    if (socket_send_request(fd, &ctx)) {
+        deny(&ctx);
+    }
+    if (socket_receive_result(fd, buf, sizeof(buf))) {
+        deny(&ctx);
     }
 
+    close(fd);
     close(socket_serv_fd);
     socket_cleanup();
 
     result = buf;
 
+#define SOCKET_RESPONSE	"socket:"
+    if (strncmp(result, SOCKET_RESPONSE, sizeof(SOCKET_RESPONSE) - 1))
+        LOGW("SECURITY RISK: Requestor still receives credentials in intent");
+    else
+        result += sizeof(SOCKET_RESPONSE) - 1;
+
     if (!strcmp(result, "DENY")) {
-        deny();
+        deny(&ctx);
     } else if (!strcmp(result, "ALLOW")) {
-        allow(shell);
+        allow(&ctx);
     } else {
         LOGE("unknown response from Superuser Requestor: %s", result);
-        deny();
+        deny(&ctx);
     }
 
-    deny();
+    deny(&ctx);
     return -1;
 }
