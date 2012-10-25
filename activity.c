@@ -16,11 +16,8 @@
 */
 
 #include <unistd.h>
-<<<<<<< HEAD
 #include <stdlib.h>
 #include <stdio.h>
-=======
->>>>>>> b2bb9fc1c9645724a8c23125439bb1f8a367c93d
 
 #include "su.h"
 
